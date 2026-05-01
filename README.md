@@ -10,8 +10,20 @@ This repository contains the R code supporting:
  
 This pipeline transforms epoch-level step-count data from commercial Garmin wearable devices into participant-level analytic variables suitable for epidemiologic research. It was developed for and applied to the STRRIDE-PD Reunion study, a long-term follow-up cohort of older adults originally enrolled in a supervised exercise intervention trial.
  
-The pipeline makes all analytic decisions explicit and reproducible, including timestamp standardization, daily epoch grid reconstruction, wear-time inference from observed step patterns, valid-day classification, and participant-level summary generation.
+The pipeline makes all analytic decisions explicit and reproducible, including timestamp standardization, daily epoch grid reconstruction, wear-time inference from observed step patterns, valid-day classification, and participant-level summary generation. They are declared in a single configuration block at the top of the document and propagated throughout, so that any parameter change requires editing only one location.
  
+---
+
+## Repository Contents
+ 
+| File | Description |
+|---|---|
+| `step_count_pipeline.Rmd` | Fully documented R Markdown pipeline (source) |
+| `step_count_pipeline.html` | Knitted HTML |
+| `README.md` | This file |
+ 
+The `.Rmd` file is the primary deliverable. The knitted `.html` provides a readable view of the pipeline without requiring R to be installed.
+
 ---
 
 ## Data Availability
@@ -38,12 +50,15 @@ install.packages(c(
  
 ## Key Analytic Decisions
  
-| Decision | Value used | Justification |
+All parameters below are defined in the `config` chunk at the top of `step_count_pipeline.Rmd` and can be modified without changing any downstream code.
+ 
+| Parameter | Value used | Justification |
 |---|---|---|
 | Epoch length | 15 minutes | Device default (Garmin vívosmart 5 via Pattern Health) |
+| Max gap treated as non-wear | 100 consecutive epochs | Runs of ≥ 100 missing epochs excluded from zero-imputation |
 | Wear-time inference | First to last non-zero step epoch within each day | No device-generated wear indicators available |
 | Valid-day threshold (primary) | ≥ 10 hours inferred wear time | Consistent with NHANES conventions and accelerometer literature |
-| Valid-day threshold (sensitivity) | ≥ 6 hours inferred wear time | Evaluated in sensitivity analysis; results identical |
+| Valid-day threshold (sensitivity) | ≥ 6 hours inferred wear time | Evaluated in sensitivity analysis |
 | Minimum valid days per participant | ≥ 4 days | Consistent with evidence for reliable habitual PA estimation in older adults |
  
 ---

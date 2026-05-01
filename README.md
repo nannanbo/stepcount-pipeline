@@ -36,14 +36,6 @@ install.packages(c(
  
 ---
  
-## Usage
- 
-Scripts are intended to be run sequentially. Begin with `01_data_processing.R`, which expects raw epoch-level data as input, and produces a cleaned participant-level dataset used by all downstream scripts.
- 
-Key parameters (valid-day threshold, minimum valid days per participant, epoch length) are defined at the top of `01_data_processing.R` and can be modified to adapt the pipeline to other devices or study designs.
- 
----
- 
 ## Key Analytic Decisions
  
 | Decision | Value used | Justification |

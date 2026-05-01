@@ -1,0 +1,503 @@
+---
+title: "Standard Operating Procedure: Processing Commercial Wearable Step-Count Data"
+author: ""
+date: ""
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, message = FALSE, warning = FALSE)
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+---
+
+# Overview
+
+This document implements a transparent, reproducible standard operating procedure
+(SOP) for transforming epoch-level step-count data from commercial Garmin devices
+into participant-level analytic variables. The pipeline standardizes timestamps,
+reconstructs daily epoch grids, infers wear time from observed step patterns, and
+applies a prespecified valid-day threshold to generate daily and participant-level
+summaries.
+
+The pipeline is designed for settings where device-generated wear-time indicators
+are unavailable. All operational definitions — epoch length, wear-time inference
+rules, valid-day threshold, and quality-control criteria — are declared in a single
+configuration block and propagated throughout, so that any parameter change
+requires editing only one location.
+
+---
+
+# Configuration
+
+```{r config}
+# ── File paths ─────────────────────────────────────────────────────────────────
+PATH_STEPS   <- "path/to/raw_step_count_data.xlsx"
+PATH_FILLED  <- "path/to/output/filled_step_counts.csv"       # optional save
+PATH_SUMMARY <- "path/to/output/participant_step_summary.csv" # optional save
+
+# ── Processing parameters ──────────────────────────────────────────────────────
+EPOCH_MIN        <- 15   # epoch length in minutes
+MAX_GAP_EPOCHS   <- 100  # consecutive missing epochs >= this are treated as non-wear
+VALID_DAY_HR_PRI <- 10   # primary valid-day threshold (hours); consistent with NHANES convention
+VALID_DAY_HR_SEN <- 6    # sensitivity valid-day threshold (hours)
+MIN_VALID_DAYS   <- 4    # minimum valid days to retain a participant in summaries
+```
+
+---
+
+# Step 1: Load and Inspect Raw Data
+
+Raw data are imported from the device platform export. Timestamps are standardized
+and the time zone offset is recorded. The raw file is expected to contain one row
+per epoch with at minimum: a participant identifier, epoch start time, epoch end
+time, and step count value.
+
+```{r load}
+step_data_raw <- read_excel(PATH_STEPS) %>%
+  rename(
+    participant_id   = `User Name`,
+    start_time       = `Start Time`,
+    end_time         = `End Time`,
+    time_zone_offset = `Time Zone Offset`,
+    value            = Value
+  )
+
+cat("Participants in raw data:", n_distinct(step_data_raw$participant_id), "\n")
+cat("Total epoch records:     ", nrow(step_data_raw), "\n")
+cat("Date range:              ",
+    format(min(as.Date(step_data_raw$start_time))), "to",
+    format(max(as.Date(step_data_raw$start_time))), "\n")
+cat("Time zone offsets present:",
+    paste(unique(step_data_raw$time_zone_offset), collapse = ", "), "\n")
+```
+
+---
+
+# Step 2: Standardize Timestamps and Remove Irregular Epochs
+
+Duplicate records sharing the same participant and start time are removed, retaining
+the longer epoch. Epochs exceeding the nominal epoch length — which may reflect
+device export artifacts or non-wear segments — are excluded.
+
+```{r clean}
+stepsall <- step_data_raw %>%
+  mutate(
+    length = as.numeric(difftime(end_time, start_time, units = "mins")),
+    date   = as.Date(start_time)
+  ) %>%
+  arrange(desc(length)) %>%
+  distinct(participant_id, start_time, .keep_all = TRUE) %>%
+  filter(length <= EPOCH_MIN) %>%
+  select(participant_id, start_time, end_time, date, length, value)
+
+cat("Epoch records after cleaning:", nrow(stepsall), "\n")
+cat("Participants retained:        ", n_distinct(stepsall$participant_id), "\n")
+
+non_standard <- stepsall %>% filter(length != EPOCH_MIN)
+if (nrow(non_standard) > 0) {
+  message(nrow(non_standard), " epochs with non-standard length remaining:")
+  print(non_standard)
+} else {
+  message("All retained epochs are exactly ", EPOCH_MIN, " minutes.")
+}
+```
+
+---
+
+# Step 3: Reconstruct Daily Epoch Grids and Infer Wear Time
+
+## Operational definitions
+
+**Epoch:** The smallest unit of time over which step counts are recorded. In this
+implementation, step counts are aggregated in fixed EPOCH_MIN-minute intervals.
+All processing is conducted at the epoch level prior to daily aggregation.
+
+**Wear time:** Because direct wear-time indicators are unavailable, wear time is
+operationally inferred from observed step patterns. Within each calendar day, the
+wear window is defined as the interval between the first and last detected non-zero
+step epoch. Zero-step epochs falling within this window are retained and treated as
+potential inactivity. Gaps of MAX_GAP_EPOCHS or more consecutive missing epochs
+within the wear window are treated as non-wear and excluded from imputation.
+
+**Valid day:** A calendar day with at least VALID_DAY_HR_PRI hours of inferred
+wear time under the primary threshold, or VALID_DAY_HR_SEN hours under the
+sensitivity threshold.
+
+## Helper functions
+
+```{r helpers}
+
+#' Identify runs of consecutive integers of length >= min_run
+#'
+#' @param x       Integer vector (need not be sorted)
+#' @param min_run Minimum run length to flag
+#' @return List: `sequences` (list of integer vectors), `count` (number of runs found)
+find_consecutive_runs <- function(x, min_run) {
+  x <- sort(x)
+  if (length(x) == 0) return(list(sequences = list(), count = 0L))
+  grp       <- cumsum(c(1L, diff(x) != 1L))
+  runs      <- split(x, grp)
+  long_runs <- runs[lengths(runs) >= min_run]
+  list(sequences = long_runs, count = length(long_runs))
+}
+
+
+#' Insert a single zero-step epoch into a participant-day data frame
+#'
+#' @param df             Data frame for one participant-day (must contain `index` column)
+#' @param missing_index  Epoch index to insert
+#' @param subj           participant_id string
+#' @param date_subj      Date object
+#' @param time_intervals POSIXct vector of all epoch start times for that day
+#' @return Data frame with the new zero-step row inserted, sorted by index
+insert_zero_epoch <- function(df, missing_index, subj, date_subj, time_intervals) {
+  new_row                <- df[1L, ]
+  new_row[]              <- NA
+  new_row$participant_id <- subj
+  new_row$start_time     <- time_intervals[missing_index]
+  new_row$end_time       <- time_intervals[missing_index + 1L]
+  new_row$date           <- as.Date(date_subj)
+  new_row$length         <- EPOCH_MIN
+  new_row$value          <- 0L
+  new_row$index          <- missing_index
+  bind_rows(df, new_row) %>% arrange(index)
+}
+
+
+#' Fill zero-step epochs within a participant-day wear window
+#'
+#' Missing epochs between the first and last observed epoch are imputed as zero
+#' steps, except for runs of >= MAX_GAP_EPOCHS consecutive missing epochs, which
+#' are treated as non-wear and left unfilled.
+#'
+#' @param subj       participant_id string
+#' @param date_subj  Date object
+#' @return List: `data` (filled data frame), `n_nonwear_gaps` (count of long gaps skipped)
+fill_day <- function(subj, date_subj) {
+  day_df <- stepsall %>%
+    filter(participant_id == subj, date == date_subj) %>%
+    distinct()
+
+  time_intervals <- seq(
+    from = as.POSIXct(paste(date_subj, "00:00:00")),
+    to   = as.POSIXct(paste(date_subj, "23:45:00")),
+    by   = paste(EPOCH_MIN, "mins")
+  )
+
+  day_df$index <- match(day_df$start_time, time_intervals)
+  valid_idx    <- day_df$index[!is.na(day_df$index)]
+  all_idx      <- seq(min(valid_idx), max(valid_idx))
+  missing_idx  <- setdiff(all_idx, valid_idx)
+
+  if (length(missing_idx) <= 1L) {
+    n_nonwear_gaps <- 0L
+  } else {
+    runs           <- find_consecutive_runs(missing_idx, MAX_GAP_EPOCHS)
+    n_nonwear_gaps <- runs$count
+    missing_idx    <- setdiff(missing_idx, unlist(runs$sequences))
+  }
+
+  for (idx in missing_idx) {
+    day_df <- insert_zero_epoch(day_df, idx, subj, date_subj, time_intervals)
+  }
+
+  list(data = day_df, n_nonwear_gaps = n_nonwear_gaps)
+}
+```
+
+## Apply across all participant-days
+
+Days with only a single observed epoch are excluded before filling, as a wear
+window cannot be defined from a single point.
+
+```{r impute}
+subj_dates <- stepsall %>%
+  group_by(participant_id, date) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  filter(n > 1L) %>%
+  mutate(date = as.Date(date))
+
+results_list <- vector("list", nrow(subj_dates))
+for (i in seq_len(nrow(subj_dates))) {
+  results_list[[i]] <- fill_day(subj_dates$participant_id[i], subj_dates$date[i])
+}
+
+filled_data_all <- bind_rows(lapply(results_list, `[[`, "data"))
+
+cat("Participant-days processed:", nrow(subj_dates), "\n")
+cat("Participants:              ", n_distinct(filled_data_all$participant_id), "\n")
+
+# Optional: save filled epoch data
+# write.csv(filled_data_all, PATH_FILLED, row.names = FALSE)
+```
+
+---
+
+# Step 4: Apply Valid-Day Threshold and Generate Summaries
+
+Participant-level metrics — mean daily steps, within-person standard deviation,
+coefficient of variation, and number of valid days — are derived from the valid-day
+set under both thresholds. Participants with fewer than MIN_VALID_DAYS valid
+days are excluded from summaries.
+
+```{r summarise}
+epochs_per_hr <- 60L / EPOCH_MIN
+
+#' Compute participant-level step-count summaries for a given valid-day threshold
+#'
+#' @param threshold_hr  Minimum inferred wear time (hours) to classify a day as valid
+#' @return Participant-level data frame: mean_steps, sd_steps, cv_steps, valid_days
+summarise_steps <- function(threshold_hr) {
+  filled_data_all %>%
+    group_by(participant_id, date) %>%
+    summarise(
+      wear_time_hr = n() / epochs_per_hr,
+      total_steps  = sum(value, na.rm = TRUE),
+      .groups      = "drop"
+    ) %>%
+    filter(wear_time_hr >= threshold_hr) %>%
+    group_by(participant_id) %>%
+    summarise(
+      mean_steps = mean(total_steps, na.rm = TRUE),
+      sd_steps   = sd(total_steps,   na.rm = TRUE),
+      cv_steps   = sd_steps / mean_steps,
+      valid_days = n(),
+      .groups    = "drop"
+    ) %>%
+    filter(valid_days >= MIN_VALID_DAYS)
+}
+
+summary_pri <- summarise_steps(VALID_DAY_HR_PRI)
+summary_sen <- summarise_steps(VALID_DAY_HR_SEN)
+
+cat("Participants with ≥", MIN_VALID_DAYS, "valid days:\n")
+cat("  Primary threshold    (≥", VALID_DAY_HR_PRI, "h):", nrow(summary_pri), "\n")
+cat("  Sensitivity threshold (≥", VALID_DAY_HR_SEN, "h):", nrow(summary_sen), "\n")
+
+# Optional: save primary participant-level summary
+# write.csv(summary_pri, PATH_SUMMARY, row.names = FALSE)
+```
+
+---
+
+# Step 5: Quality Control
+
+Descriptive summaries and visualizations are generated prior to downstream analysis
+to identify implausible or irregular step-count patterns that could reflect device
+malfunction, data corruption, or substantial non-wear.
+
+```{r qc_setup}
+# Daily-level data under the primary threshold, used throughout QC
+daily_pri <- filled_data_all %>%
+  group_by(participant_id, date) %>%
+  summarise(
+    wear_time_hr = n() / epochs_per_hr,
+    total_steps  = sum(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(wear_time_hr >= VALID_DAY_HR_PRI)
+
+theme_sop <- function() {
+  theme_minimal() +
+    theme(plot.title = element_text(face = "bold"))
+}
+```
+
+## Wear-time distribution on valid days
+
+```{r qc_weartime, fig.width=7, fig.height=4}
+ggplot(daily_pri, aes(x = wear_time_hr)) +
+  geom_histogram(binwidth = 0.25, fill = "steelblue", color = "white") +
+  labs(
+    title = paste0("Daily Wear Time on Valid Days (≥", VALID_DAY_HR_PRI, "h threshold)"),
+    x     = "Inferred wear time (hours)",
+    y     = "Participant-days"
+  ) +
+  theme_sop()
+```
+
+## Daily step-count distribution on valid days
+
+```{r qc_daily_steps, fig.width=7, fig.height=4}
+ggplot(daily_pri, aes(x = total_steps)) +
+  geom_histogram(binwidth = 1000, fill = "steelblue", color = "white") +
+  labs(
+    title = paste0("Daily Step Counts on Valid Days (≥", VALID_DAY_HR_PRI, "h threshold)"),
+    x     = "Daily step count",
+    y     = "Participant-days"
+  ) +
+  theme_sop()
+```
+
+## Participant-level mean daily steps
+
+```{r qc_participant_steps, fig.width=7, fig.height=4}
+sample_median <- median(summary_pri$mean_steps)
+
+ggplot(summary_pri, aes(x = mean_steps)) +
+  geom_histogram(binwidth = 1000, fill = "steelblue", color = "white") +
+  geom_vline(xintercept = sample_median, linetype = "dashed", color = "firebrick") +
+  labs(
+    title    = "Participant-Level Mean Daily Steps",
+    subtitle = paste0("Primary threshold (≥", VALID_DAY_HR_PRI,
+                      "h); dashed line = sample median (",
+                      round(sample_median), " steps)"),
+    x = "Mean daily steps",
+    y = "Participants"
+  ) +
+  theme_sop()
+```
+
+## Per-participant daily step boxplots
+
+Per-participant boxplots of daily step counts provide a visual quality check for
+outlying days or participants with implausible patterns.
+
+```{r qc_boxplots, fig.width=10, fig.height=5}
+# Order participants by their mean daily steps for readability
+participant_order <- summary_pri %>%
+  arrange(mean_steps) %>%
+  pull(participant_id)
+
+daily_pri %>%
+  mutate(participant_id = factor(participant_id, levels = participant_order)) %>%
+  ggplot(aes(x = participant_id, y = total_steps)) +
+  geom_boxplot(fill = "steelblue", color = "grey30",
+               outlier.size = 1, outlier.alpha = 0.5) +
+  stat_summary(fun = mean, geom = "point",
+               shape = 18, size = 2, color = "firebrick") +
+  labs(
+    title    = "Daily Step Counts by Participant (sorted by mean)",
+    subtitle = "Boxes = IQR and median; diamonds = mean",
+    x        = "Participant (sorted by mean daily steps)",
+    y        = "Daily steps"
+  ) +
+  theme_sop() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+```
+
+---
+
+# Step 6: Sensitivity Analysis — Valid-Day Threshold
+
+Participant-level estimates are compared across the primary (VALID_DAY_HR_PRI h)
+and sensitivity (VALID_DAY_HR_SEN h) valid-day thresholds to verify that the
+choice of threshold does not materially influence derived step-count summaries.
+
+```{r sensitivity_threshold}
+# Participants retained under both thresholds
+compare_thresholds <- summary_sen %>%
+  rename(mean_steps_sen = mean_steps, sd_steps_sen = sd_steps,
+         cv_steps_sen   = cv_steps,   valid_days_sen = valid_days) %>%
+  inner_join(
+    summary_pri %>%
+      rename(mean_steps_pri = mean_steps, sd_steps_pri = sd_steps,
+             cv_steps_pri   = cv_steps,   valid_days_pri = valid_days),
+    by = "participant_id"
+  ) %>%
+  mutate(
+    days_lost       = valid_days_sen - valid_days_pri,
+    pct_days_lost   = if_else(valid_days_sen > 0, days_lost / valid_days_sen, NA_real_),
+    diff_mean_steps = mean_steps_pri - mean_steps_sen,
+    diff_cv         = cv_steps_pri   - cv_steps_sen
+  )
+
+dropped_by_primary <- anti_join(summary_sen, summary_pri, by = "participant_id")
+
+cat("Participants under ≥", VALID_DAY_HR_SEN, "h (sensitivity):", nrow(summary_sen), "\n")
+cat("Participants under ≥", VALID_DAY_HR_PRI, "h (primary):    ", nrow(summary_pri), "\n")
+cat("Dropped by primary threshold:            ", nrow(dropped_by_primary), "\n\n")
+
+cat("Days lost (strict − lenient) — median [min, max]:\n  ",
+    median(compare_thresholds$days_lost), " [",
+    min(compare_thresholds$days_lost), ", ",
+    max(compare_thresholds$days_lost), "]\n\n", sep = "")
+
+cat("Proportion of valid days lost — median [min, max]:\n  ",
+    round(median(compare_thresholds$pct_days_lost), 3), " [",
+    round(min(compare_thresholds$pct_days_lost), 3), ", ",
+    round(max(compare_thresholds$pct_days_lost), 3), "]\n\n", sep = "")
+
+cat("Δ mean daily steps (primary − sensitivity) — median [min, max]:\n  ",
+    round(median(compare_thresholds$diff_mean_steps), 1), " [",
+    round(min(compare_thresholds$diff_mean_steps), 1), ", ",
+    round(max(compare_thresholds$diff_mean_steps), 1), "]\n\n", sep = "")
+
+tibble(
+  Threshold           = c(paste0("≥", VALID_DAY_HR_SEN, "h (sensitivity)"),
+                          paste0("≥", VALID_DAY_HR_PRI, "h (primary)")),
+  n                   = c(nrow(summary_sen), nrow(summary_pri)),
+  `Median valid days` = c(median(compare_thresholds$valid_days_sen),
+                          median(compare_thresholds$valid_days_pri)),
+  `Median mean steps` = c(round(median(compare_thresholds$mean_steps_sen)),
+                          round(median(compare_thresholds$mean_steps_pri))),
+  `Median CV`         = c(round(median(compare_thresholds$cv_steps_sen), 3),
+                          round(median(compare_thresholds$cv_steps_pri), 3))
+) %>% print()
+```
+
+```{r sensitivity_threshold_plot, fig.width=7, fig.height=4}
+compare_thresholds %>%
+  select(participant_id, mean_steps_sen, mean_steps_pri) %>%
+  pivot_longer(
+    cols      = c(mean_steps_sen, mean_steps_pri),
+    names_to  = "threshold",
+    values_to = "mean_steps"
+  ) %>%
+  mutate(
+    threshold = factor(threshold,
+                       levels = c("mean_steps_sen", "mean_steps_pri"),
+                       labels = c(paste0("≥", VALID_DAY_HR_SEN, "h (sensitivity)"),
+                                  paste0("≥", VALID_DAY_HR_PRI, "h (primary)")))
+  ) %>%
+  ggplot(aes(x = threshold, y = mean_steps, group = participant_id)) +
+  geom_line(color = "grey75", linewidth = 0.4) +
+  geom_point(aes(color = threshold), size = 2, alpha = 0.75) +
+  scale_color_manual(values = c("steelblue", "firebrick"), guide = "none") +
+  labs(
+    title    = "Mean Daily Steps by Valid-Day Threshold",
+    subtitle = paste0("Each line = one participant (n = ",
+                      nrow(compare_thresholds), " common to both thresholds)"),
+    x = "Valid-day threshold",
+    y = "Mean daily steps"
+  ) +
+  theme_sop()
+```
+
+---
+
+# Participant-Level Summary
+
+Final participant-level step-count estimates under the primary threshold.
+
+```{r final_summary}
+cat("── Participant-level step-count summary",
+    "(primary threshold ≥", VALID_DAY_HR_PRI, "h) ──\n")
+cat("  n:                                    ", nrow(summary_pri), "\n")
+cat("  Valid days — median [min, max]:       ",
+    median(summary_pri$valid_days), " [",
+    min(summary_pri$valid_days), ", ",
+    max(summary_pri$valid_days), "]\n", sep = "")
+cat("  Mean daily steps — median (Q1, Q3):  ",
+    round(median(summary_pri$mean_steps)), " (",
+    round(quantile(summary_pri$mean_steps, 0.25)), ", ",
+    round(quantile(summary_pri$mean_steps, 0.75)), ")\n", sep = "")
+cat("  Within-person SD — median (Q1, Q3):  ",
+    round(median(summary_pri$sd_steps)), " (",
+    round(quantile(summary_pri$sd_steps, 0.25)), ", ",
+    round(quantile(summary_pri$sd_steps, 0.75)), ")\n", sep = "")
+cat("  Coefficient of variation — median:    ",
+    round(median(summary_pri$cv_steps), 3), "\n", sep = "")
+```
